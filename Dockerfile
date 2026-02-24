@@ -4,8 +4,9 @@ FROM python:3.10-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (including git)
 RUN apt-get update && apt-get install -y \
+    git \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
@@ -15,9 +16,16 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY src/ ./src/
-COPY run.py .
+# Clone the GitHub repository
+# Set your GitHub repository URL here
+ARG GITHUB_REPO=https://github.com/opq007/pry.git
+ARG GITHUB_BRANCH=master
+
+RUN echo "Cloning from $GITHUB_REPO..." && \
+    git clone --depth 1 --branch ${GITHUB_BRANCH} ${GITHUB_REPO} /tmp/repo && \
+    cp -r /tmp/repo/src /app/ && \
+    cp /tmp/repo/run.py /app/ && \
+    rm -rf /tmp/repo
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

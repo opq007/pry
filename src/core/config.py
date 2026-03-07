@@ -21,6 +21,11 @@ class Config:
     TIMEOUT_SEC: int = 3
     MAX_THREADS: int = 2000
 
+    # Proxy Forwarding Configuration
+    FORWARD_TIMEOUT: int = int(os.getenv("FORWARD_TIMEOUT", "30"))
+    FORWARD_MAX_RETRIES: int = int(os.getenv("FORWARD_MAX_RETRIES", "3"))
+    FORWARD_MAX_BODY_SIZE: int = int(os.getenv("FORWARD_MAX_BODY_SIZE", str(10 * 1024 * 1024)))  # 10MB
+
     # Validation
     VALIDATION_URL: str = "https://www.youtube.com"
 

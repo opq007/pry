@@ -3,7 +3,7 @@ Thread-safe proxy pool manager.
 """
 import threading
 from datetime import datetime
-from typing import List
+from typing import List, Tuple, Optional
 
 
 class ProxyPool:
@@ -20,6 +20,7 @@ class ProxyPool:
         self._lock = threading.Lock()
         self.valid_proxies: List[str] = []
         self.last_updated: str = "Not yet started"
+        self._round_robin_index: int = 0  # 轮询索引
 
     def get_proxies(self) -> List[str]:
         """
@@ -42,6 +43,20 @@ class ProxyPool:
             self.valid_proxies = new_proxies[:self.target_count]
             self.last_updated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    def get_next_proxy(self) -> Optional[str]:
+        """
+        Get next proxy using round-robin (thread-safe).
+
+        Returns:
+            Proxy string in "ip:port" format, or None if pool is empty
+        """
+        with self._lock:
+            if not self.valid_proxies:
+                return None
+            proxy = self.valid_proxies[self._round_robin_index % len(self.valid_proxies)]
+            self._round_robin_index += 1
+            return proxy
+
     def get_status(self) -> dict:
         """
         Get proxy pool status (thread-safe).
@@ -53,5 +68,6 @@ class ProxyPool:
             return {
                 "proxy_pool_size": len(self.valid_proxies),
                 "target_count": self.target_count,
-                "last_updated": self.last_updated
+                "last_updated": self.last_updated,
+                "proxy_types": ["http", "socks5"]
             }

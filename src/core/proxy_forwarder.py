@@ -1,8 +1,10 @@
 """
 Proxy forwarder - forwards requests through proxy pool with SOCKS5 support.
+Supports streaming responses for OpenAI-compatible APIs.
 """
 import requests
-from typing import Optional, Dict, Any, Tuple
+import json
+from typing import Optional, Dict, Any, Tuple, Generator, Union
 from .proxy_pool import ProxyPool
 from .config import config
 
@@ -10,7 +12,7 @@ from .config import config
 class ProxyForwarder:
     """
     Forward HTTP requests through proxy pool with round-robin selection.
-    Supports both HTTP and SOCKS5 proxies.
+    Supports both HTTP and SOCKS5 proxies, and streaming responses.
     """
 
     def __init__(self, proxy_pool: ProxyPool):
@@ -46,6 +48,58 @@ class ProxyForwarder:
                 "https": f"http://{proxy}"
             }
 
+    def _is_stream_request(self, headers: Optional[Dict[str, str]], body: Optional[bytes]) -> bool:
+        """
+        Detect if request is a streaming request.
+
+        Checks:
+        1. Accept header for text/event-stream
+        2. Request body contains "stream": true (OpenAI style)
+        3. Request body contains "sse": true (airforce and other platforms style)
+
+        Args:
+            headers: Request headers
+            body: Request body
+
+        Returns:
+            True if this is a streaming request
+        """
+        # Check Accept header
+        if headers:
+            accept = headers.get("accept", "").lower()
+            if "text/event-stream" in accept:
+                return True
+
+        # Check body for stream/sse flags (OpenAI and alternative API styles)
+        if body:
+            try:
+                # Try to parse as JSON
+                body_str = body.decode("utf-8") if isinstance(body, bytes) else body
+                body_json = json.loads(body_str)
+                # OpenAI style: stream: true
+                if body_json.get("stream") is True:
+                    return True
+                # Alternative style (airforce, etc.): sse: true
+                if body_json.get("sse") is True:
+                    return True
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+        return False
+
+    def _is_stream_response(self, response: requests.Response) -> bool:
+        """
+        Check if response is a streaming response.
+
+        Args:
+            response: The response object
+
+        Returns:
+            True if response is streaming (SSE)
+        """
+        content_type = response.headers.get("content-type", "").lower()
+        return "text/event-stream" in content_type
+
     def forward_request(
         self,
         method: str,
@@ -56,7 +110,8 @@ class ProxyForwarder:
         proxy_type: str = "http",
         timeout: Optional[int] = None,
         max_retries: int = 3,
-        fallback_direct: bool = True
+        fallback_direct: bool = True,
+        stream: bool = False
     ) -> Tuple[Optional[requests.Response], Optional[str]]:
         """
         Forward a request through proxy pool with automatic retry.
@@ -68,16 +123,30 @@ class ProxyForwarder:
             body: Request body (for POST/PUT)
             params: Query parameters
             proxy_type: "http" or "socks5"
-            timeout: Request timeout in seconds
+            timeout: Request timeout in seconds (for connection, not for full response in stream mode)
             max_retries: Maximum retry attempts with different proxies
             fallback_direct: If True, fall back to direct request when proxy pool is empty
+            stream: If True, enable streaming mode for SSE responses
 
         Returns:
             Tuple of (Response, proxy_used) or (None, error_message) on failure.
             proxy_used is "DIRECT" when fallback to direct request.
+            
+            When stream=True and response is SSE, response.iter_content() can be used
+            to iterate over chunks. The response connection stays open until consumed.
         """
         if timeout is None:
             timeout = config.FORWARD_TIMEOUT
+
+        # Auto-detect stream mode if not explicitly set
+        if not stream:
+            stream = self._is_stream_request(headers, body)
+
+        # For stream mode, use longer timeout for connection only
+        # The response will be streamed, so we don't want a read timeout
+        connect_timeout = timeout
+        read_timeout = None if stream else timeout
+        timeout_tuple = (connect_timeout, read_timeout) if stream else timeout
 
         last_error = None
 
@@ -97,8 +166,9 @@ class ProxyForwarder:
                     data=body,
                     params=params,
                     proxies=proxies,
-                    timeout=timeout,
-                    allow_redirects=True
+                    timeout=timeout_tuple,
+                    allow_redirects=True,
+                    stream=stream  # Enable streaming mode
                 )
                 return response, proxy
 
@@ -121,8 +191,9 @@ class ProxyForwarder:
                     headers=headers,
                     data=body,
                     params=params,
-                    timeout=timeout,
-                    allow_redirects=True
+                    timeout=timeout_tuple,
+                    allow_redirects=True,
+                    stream=stream
                 )
                 return response, "DIRECT"
             except requests.exceptions.RequestException as e:

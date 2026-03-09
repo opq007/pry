@@ -1,10 +1,12 @@
 """
 API routes for FastAPI Proxy Service.
+Supports streaming responses for OpenAI-compatible APIs.
 """
 from fastapi import APIRouter, Depends, Request, Query, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from datetime import datetime
 from typing import Optional
+import json
 from .auth import verify_token
 from ..core.proxy_forwarder import ProxyForwarder
 from ..core.config import config
@@ -54,6 +56,81 @@ async def get_proxies(token = Depends(verify_token), pool = Depends(get_proxy_po
     }
 
 
+def _is_stream_request(headers: dict, body: bytes) -> bool:
+    """
+    Detect if request is a streaming request.
+
+    Checks:
+    1. Accept header for text/event-stream
+    2. Request body contains "stream": true (OpenAI style)
+    3. Request body contains "sse": true (airforce and other platforms style)
+
+    Args:
+        headers: Request headers dict
+        body: Request body bytes
+
+    Returns:
+        True if this is a streaming request
+    """
+    # Check Accept header
+    accept = headers.get("accept", "").lower()
+    if "text/event-stream" in accept:
+        return True
+
+    # Check body for stream/sse flags (OpenAI and alternative API styles)
+    if body:
+        try:
+            body_str = body.decode("utf-8") if isinstance(body, bytes) else body
+            body_json = json.loads(body_str)
+            # OpenAI style: stream: true
+            if body_json.get("stream") is True:
+                return True
+            # Alternative style (airforce, etc.): sse: true
+            if body_json.get("sse") is True:
+                return True
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+    return False
+
+
+def _is_stream_response(response) -> bool:
+    """
+    Check if response is a streaming response.
+
+    Args:
+        response: The requests Response object
+
+    Returns:
+        True if response is streaming (SSE)
+    """
+    content_type = response.headers.get("content-type", "").lower()
+    return "text/event-stream" in content_type
+
+
+def _stream_generator(response, proxy_used: str):
+    """
+    Generator that yields response chunks for streaming.
+
+    Args:
+        response: The requests Response object with stream=True
+        proxy_used: The proxy that was used (for header injection)
+
+    Yields:
+        Response chunks as bytes
+    """
+    try:
+        # First, yield SSE comment with proxy info (non-intrusive)
+        yield f": proxy-used: {proxy_used}\n\n".encode("utf-8")
+        
+        # Then yield the actual response chunks
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                yield chunk
+    finally:
+        response.close()
+
+
 @router.api_route("/api/proxy/forward", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def forward_request(
     request: Request,
@@ -73,6 +150,9 @@ async def forward_request(
 
     Supports both HTTP and SOCKS5 proxies.
 
+    **Streaming Support**: Automatically detects and handles OpenAI-style
+    streaming requests (SSE). The response will be streamed chunk by chunk.
+
     **Fallback**: If proxy pool is empty, falls back to direct request.
 
     **Authentication (use ONE of these methods):**
@@ -90,9 +170,11 @@ async def forward_request(
 
     **Response Headers:**
     - X-Proxy-Used: The proxy used (e.g., "1.2.3.4:8080") or "DIRECT" if fallback
+    - For streaming responses, proxy info is sent as SSE comment: `: proxy-used: xxx`
 
     **Response:**
     - Returns the target response with status code, headers, and body
+    - Streaming responses are returned as Server-Sent Events (SSE)
     """
     # Validate proxy type
     if proxy_type.lower() not in ["http", "socks5"]:
@@ -111,6 +193,9 @@ async def forward_request(
         if len(body) > config.FORWARD_MAX_BODY_SIZE:
             raise HTTPException(status_code=413, detail="Request body too large")
 
+    # Detect if this is a streaming request
+    is_stream = _is_stream_request(headers, body)
+
     # Forward the request (with fallback to direct request)
     response, proxy_or_error = forwarder.forward_request(
         method=request.method,
@@ -120,7 +205,8 @@ async def forward_request(
         proxy_type=proxy_type.lower(),
         timeout=timeout,
         max_retries=config.FORWARD_MAX_RETRIES,
-        fallback_direct=True
+        fallback_direct=True,
+        stream=is_stream  # Pass stream flag
     )
 
     if response is None:
@@ -132,15 +218,29 @@ async def forward_request(
         k: v for k, v in response.headers.items()
         if k.lower() not in excluded_headers
     }
-    # Add proxy info header
-    response_headers["X-Proxy-Used"] = proxy_or_error
 
-    return Response(
-        content=response.content,
-        status_code=response.status_code,
-        headers=response_headers,
-        media_type=response.headers.get("content-type")
-    )
+    # Check if response is streaming (SSE)
+    is_stream_response = _is_stream_response(response)
+
+    if is_stream_response or is_stream:
+        # For streaming responses, use StreamingResponse
+        # Inject proxy info as SSE comment in the stream
+        return StreamingResponse(
+            _stream_generator(response, proxy_or_error),
+            status_code=response.status_code,
+            headers=response_headers,
+            media_type="text/event-stream"
+        )
+    else:
+        # For non-streaming responses, add proxy info header
+        response_headers["X-Proxy-Used"] = proxy_or_error
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=response_headers,
+            media_type=response.headers.get("content-type")
+        )
 
 
 @router.get("/api/proxy/status")

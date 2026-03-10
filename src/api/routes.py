@@ -7,9 +7,12 @@ from fastapi.responses import Response, StreamingResponse
 from datetime import datetime
 from typing import Optional
 import json
+import logging
 from .auth import verify_token
 from ..core.proxy_forwarder import ProxyForwarder
 from ..core.config import config
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -94,18 +97,142 @@ def _is_stream_request(headers: dict, body: bytes) -> bool:
     return False
 
 
-def _is_stream_response(response) -> bool:
+def _is_stream_response(response, is_stream_mode: bool = False) -> bool:
     """
     Check if response is a streaming response.
 
+    Detection strategy:
+    1. Check content-type header for text/event-stream
+    2. Fallback (only when not in stream mode): check if response content
+       starts with "data:" (SSE format). This handles platforms like airforce
+       that return SSE but may not set correct content-type header.
+
     Args:
         response: The requests Response object
+        is_stream_mode: True if the request was made with stream=True.
+                       When True, we cannot safely read response.content.
 
     Returns:
         True if response is streaming (SSE)
     """
     content_type = response.headers.get("content-type", "").lower()
-    return "text/event-stream" in content_type
+    if "text/event-stream" in content_type:
+        return True
+
+    # Fallback: detect SSE by content pattern (only when not in stream mode)
+    # This is safe because response.content is already cached
+    if not is_stream_mode:
+        try:
+            # response._content is None if not read yet, otherwise cached
+            if response._content is not None:
+                peek_size = 100
+                content = response.content[:peek_size]
+                content_str = content.decode('utf-8', errors='ignore').strip()
+                # Check for SSE patterns: "data:" or ": " (SSE comment)
+                if content_str.startswith('data:') or content_str.startswith(':'):
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _parse_sse_content(content: bytes) -> list:
+    """
+    Parse SSE content and extract JSON data lines.
+
+    Args:
+        content: SSE response content as bytes
+
+    Returns:
+        List of parsed JSON objects from SSE data lines
+    """
+    results = []
+    try:
+        content_str = content.decode('utf-8', errors='ignore')
+        for line in content_str.split('\n'):
+            line = line.strip()
+            # Skip empty lines, comments, and [DONE] marker
+            if not line or line.startswith(':') or line == 'data: [DONE]':
+                continue
+            if line.startswith('data: '):
+                json_str = line[6:]  # Remove "data: " prefix
+                try:
+                    data = json.loads(json_str)
+                    results.append(data)
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return results
+
+
+def _convert_sse_to_openai_json(sse_data: list) -> dict:
+    """
+    Convert SSE data list to standard OpenAI image generation response format.
+
+    OpenAI images/generations response format:
+    {
+        "created": timestamp,
+        "data": [
+            {"url": "https://..."} or {"b64_json": "..."}
+        ]
+    }
+
+    Args:
+        sse_data: List of parsed JSON objects from SSE stream
+
+    Returns:
+        Standard OpenAI format response dict
+    """
+    # Collect all image URLs/data from SSE events
+    images = []
+    created = None
+
+    for item in sse_data:
+        # Handle various SSE response formats
+        if isinstance(item, dict):
+            # Try to extract image data from common patterns
+            # Pattern 1: Direct image data
+            if 'url' in item:
+                images.append({'url': item['url']})
+            elif 'b64_json' in item:
+                images.append({'b64_json': item['b64_json']})
+            # Pattern 2: Nested in 'data' field
+            elif 'data' in item:
+                data = item['data']
+                if isinstance(data, list):
+                    for d in data:
+                        if isinstance(d, dict):
+                            if 'url' in d:
+                                images.append({'url': d['url']})
+                            elif 'b64_json' in d:
+                                images.append({'b64_json': d['b64_json']})
+                elif isinstance(data, dict):
+                    if 'url' in data:
+                        images.append({'url': data['url']})
+                    elif 'b64_json' in data:
+                        images.append({'b64_json': data['b64_json']})
+            # Pattern 3: image_url field
+            elif 'image_url' in item:
+                img_url = item['image_url']
+                if isinstance(img_url, dict) and 'url' in img_url:
+                    images.append({'url': img_url['url']})
+                elif isinstance(img_url, str):
+                    images.append({'url': img_url})
+            # Capture created timestamp if available
+            if 'created' in item and created is None:
+                created = item['created']
+
+    # Build OpenAI compatible response
+    if created is None:
+        import time
+        created = int(time.time())
+
+    return {
+        "created": created,
+        "data": images if images else []
+    }
 
 
 def _stream_generator(response, proxy_used: str):
@@ -122,8 +249,8 @@ def _stream_generator(response, proxy_used: str):
     try:
         # First, yield SSE comment with proxy info (non-intrusive)
         yield f": proxy-used: {proxy_used}\n\n".encode("utf-8")
-        
-        # Then yield the actual response chunks
+
+        # Stream mode: yield chunks iteratively
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 yield chunk
@@ -219,20 +346,43 @@ async def forward_request(
         if k.lower() not in excluded_headers
     }
 
-    # Check if response is streaming (SSE)
-    is_stream_response = _is_stream_response(response)
+    # Check if response is streaming (SSE) - with fallback detection
+    is_stream_response = _is_stream_response(response, is_stream_mode=is_stream)
 
-    if is_stream_response or is_stream:
-        # For streaming responses, use StreamingResponse
-        # Inject proxy info as SSE comment in the stream
+    if is_stream:
+        # Request explicitly asked for stream, return SSE as-is
         return StreamingResponse(
             _stream_generator(response, proxy_or_error),
             status_code=response.status_code,
             headers=response_headers,
             media_type="text/event-stream"
         )
+    elif is_stream_response:
+        # Fallback: Request expected non-stream, but got SSE response
+        # Convert SSE to standard OpenAI JSON format
+        original_content = response.content
+        original_content_str = original_content.decode('utf-8', errors='ignore') if original_content else ''
+        
+        logger.info(f"[SSE-to-JSON] URL: {url}")
+        logger.info(f"[SSE-to-JSON] Original SSE content ({len(original_content)} bytes):\n{original_content_str[:2000]}{'...' if len(original_content_str) > 2000 else ''}")
+        
+        sse_data = _parse_sse_content(original_content)
+        logger.info(f"[SSE-to-JSON] Parsed {len(sse_data)} SSE events: {json.dumps(sse_data, ensure_ascii=False)[:1000]}")
+        
+        json_response = _convert_sse_to_openai_json(sse_data)
+        logger.info(f"[SSE-to-JSON] Converted OpenAI response: {json.dumps(json_response, ensure_ascii=False)}")
+        
+        response_headers["X-Proxy-Used"] = proxy_or_error
+        response_headers["X-SSE-Converted"] = "true"  # Indicate conversion happened
+
+        return Response(
+            content=json.dumps(json_response),
+            status_code=response.status_code,
+            headers=response_headers,
+            media_type="application/json"
+        )
     else:
-        # For non-streaming responses, add proxy info header
+        # Standard non-streaming response
         response_headers["X-Proxy-Used"] = proxy_or_error
 
         return Response(

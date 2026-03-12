@@ -26,6 +26,11 @@ class Config:
     FORWARD_MAX_RETRIES: int = int(os.getenv("FORWARD_MAX_RETRIES", "3"))
     FORWARD_MAX_BODY_SIZE: int = int(os.getenv("FORWARD_MAX_BODY_SIZE", str(10 * 1024 * 1024)))  # 10MB
 
+    # Self Proxy Configuration (used when proxy_type="self")
+    # Format: http://user:pass@host:port or socks5://user:pass@host:port
+    # If empty, requests will be forwarded directly without proxy
+    SELF_PROXY_HOST: str = os.getenv("SELF_PROXY_HOST", "")
+
     # Validation
     VALIDATION_URL: str = "https://www.youtube.com"
 

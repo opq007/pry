@@ -275,7 +275,7 @@ async def forward_request(
     selects a proxy from the pool using round-robin, and forwards
     the request to the target URL.
 
-    Supports both HTTP and SOCKS5 proxies.
+    Supports HTTP, SOCKS5 proxies, and self-configured proxy.
 
     **Streaming Support**: Automatically detects and handles OpenAI-style
     streaming requests (SSE). The response will be streamed chunk by chunk.
@@ -288,7 +288,12 @@ async def forward_request(
 
     **Query Parameters:**
     - url: Target URL (required)
-    - proxy_type: "http" or "socks5" (default: "http")
+    - proxy_type: "http", "socks5", "self", or "direct" (default: "http")
+        - "http": Use HTTP proxy from pool
+        - "socks5": Use SOCKS5 proxy from pool
+        - "self": Use self-configured proxy from SELF_PROXY_HOST env var,
+                  or direct connection if not configured
+        - "direct": Direct connection without any proxy
     - timeout: Request timeout in seconds (default: from config)
 
     **Request Headers:**
@@ -304,8 +309,8 @@ async def forward_request(
     - Streaming responses are returned as Server-Sent Events (SSE)
     """
     # Validate proxy type
-    if proxy_type.lower() not in ["http", "socks5"]:
-        raise HTTPException(status_code=400, detail="proxy_type must be 'http' or 'socks5'")
+    if proxy_type.lower() not in ["http", "socks5", "self", "direct"]:
+        raise HTTPException(status_code=400, detail="proxy_type must be 'http', 'socks5', 'self', or 'direct'")
 
     # Get request headers
     # Remove only proxy-specific headers and host, keep Authorization for target
@@ -323,18 +328,79 @@ async def forward_request(
     # Detect if this is a streaming request
     is_stream = _is_stream_request(headers, body)
 
-    # Forward the request (with fallback to direct request)
-    response, proxy_or_error = forwarder.forward_request(
-        method=request.method,
-        url=url,
-        headers=headers,
-        body=body,
-        proxy_type=proxy_type.lower(),
-        timeout=timeout,
-        max_retries=config.FORWARD_MAX_RETRIES,
-        fallback_direct=True,
-        stream=is_stream  # Pass stream flag
-    )
+    # Handle "self" and "direct" proxy types - bypass proxy pool
+    if proxy_type.lower() in ["self", "direct"]:
+        import requests as direct_requests
+        
+        proxies = None
+        proxy_used = "DIRECT"
+        
+        if proxy_type.lower() == "self":
+            self_proxy = config.SELF_PROXY_HOST.strip()
+            if self_proxy:
+                # Parse self proxy URL to determine type and build proxy config
+                # Expected format: http://user:pass@host:port or socks5://user:pass@host:port
+                if self_proxy.startswith("socks5://"):
+                    proxies = {
+                        "http": self_proxy,
+                        "https": self_proxy
+                    }
+                elif self_proxy.startswith("http://") or self_proxy.startswith("https://"):
+                    proxies = {
+                        "http": self_proxy,
+                        "https": self_proxy
+                    }
+                else:
+                    # Assume HTTP proxy if no scheme specified
+                    proxies = {
+                        "http": f"http://{self_proxy}",
+                        "https": f"http://{self_proxy}"
+                    }
+                # Extract proxy address for display (hide credentials)
+                proxy_display = self_proxy
+                if "@" in proxy_display:
+                    # Hide credentials: http://user:pass@host:port -> host:port
+                    proxy_display = proxy_display.split("@")[-1]
+                # Remove scheme prefix for display
+                for scheme in ["socks5://", "http://", "https://"]:
+                    if proxy_display.startswith(scheme):
+                        proxy_display = proxy_display[len(scheme):]
+                        break
+                proxy_used = f"SELF:{proxy_display}"
+        # For "direct" type: proxies remains None, proxy_used remains "DIRECT"
+        
+        # Prepare timeout
+        req_timeout = timeout if timeout else config.FORWARD_TIMEOUT
+        if is_stream:
+            req_timeout = (req_timeout, None)  # No read timeout for streaming
+        
+        try:
+            response = direct_requests.request(
+                method=request.method.upper(),
+                url=url,
+                headers=headers,
+                data=body,
+                proxies=proxies,
+                timeout=req_timeout,
+                allow_redirects=True,
+                stream=is_stream
+            )
+            proxy_or_error = proxy_used
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Direct request failed: {str(e)}")
+    else:
+        # Forward the request using proxy pool (with fallback to direct request)
+        response, proxy_or_error = forwarder.forward_request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            body=body,
+            proxy_type=proxy_type.lower(),
+            timeout=timeout,
+            max_retries=config.FORWARD_MAX_RETRIES,
+            fallback_direct=True,
+            stream=is_stream  # Pass stream flag
+        )
 
     if response is None:
         raise HTTPException(status_code=502, detail=f"Request failed: {proxy_or_error}")
